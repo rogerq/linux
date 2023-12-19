@@ -125,7 +125,7 @@
 	 AM65_CPSW_PN_TS_CTL_TX_ANX_F_EN)
 
 #define AM65_CPSW_ALE_AGEOUT_DEFAULT	30
-/* Number of TX/RX descriptors */
+/* Number of TX/RX descriptors per channel/flow */
 #define AM65_CPSW_MAX_TX_DESC	500
 #define AM65_CPSW_MAX_RX_DESC	500
 
@@ -137,6 +137,7 @@
 			 NETIF_MSG_RX_ERR | NETIF_MSG_TX_ERR)
 
 #define AM65_CPSW_DEFAULT_TX_CHNS	8
+#define AM65_CPSW_DEFAULT_RX_CHN_FLOWS	1
 
 static void am65_cpsw_port_set_sl_mac(struct am65_cpsw_port *slave,
 				      const u8 *dev_addr)
@@ -305,7 +306,7 @@ static void am65_cpsw_nuss_ndo_host_tx_timeout(struct net_device *ndev,
 }
 
 static int am65_cpsw_nuss_rx_push(struct am65_cpsw_common *common,
-				  struct sk_buff *skb)
+				  struct sk_buff *skb, u32 flow_idx)
 {
 	struct am65_cpsw_rx_chn *rx_chn = &common->rx_chns;
 	struct cppi5_host_desc_t *desc_rx;
@@ -337,7 +338,8 @@ static int am65_cpsw_nuss_rx_push(struct am65_cpsw_common *common,
 	swdata = cppi5_hdesc_get_swdata(desc_rx);
 	*((void **)swdata) = skb;
 
-	return k3_udma_glue_push_rx_chn(rx_chn->rx_chn, 0, desc_rx, desc_dma);
+	return k3_udma_glue_push_rx_chn(rx_chn->rx_chn, flow_idx,
+					desc_rx, desc_dma);
 }
 
 void am65_cpsw_nuss_set_p0_ptype(struct am65_cpsw_common *common)
@@ -443,7 +445,7 @@ static void am65_cpsw_nuss_tx_cleanup(void *data, dma_addr_t desc_dma)
 static int am65_cpsw_nuss_common_open(struct am65_cpsw_common *common)
 {
 	struct am65_cpsw_host *host_p = am65_common_get_host(common);
-	int port_idx, i, ret, tx;
+	int port_idx, i, ret, tx, flow_idx;
 	struct sk_buff *skb;
 	u32 val, port_mask;
 
@@ -505,29 +507,31 @@ static int am65_cpsw_nuss_common_open(struct am65_cpsw_common *common)
 
 	am65_cpsw_qos_tx_p0_rate_init(common);
 
-	for (i = 0; i < common->rx_chns.descs_num; i++) {
-		skb = __netdev_alloc_skb_ip_align(NULL,
-						  AM65_CPSW_MAX_PACKET_SIZE,
-						  GFP_KERNEL);
-		if (!skb) {
-			ret = -ENOMEM;
-			dev_err(common->dev, "cannot allocate skb\n");
-			if (i)
-				goto fail_rx;
+	for (flow_idx = 0; flow_idx < common->rx_ch_num_flows; flow_idx++) {
+		for (i = 0; i < common->rx_chns.descs_num / common->rx_ch_num_flows; i++) {
+			skb = __netdev_alloc_skb_ip_align(NULL,
+							  AM65_CPSW_MAX_PACKET_SIZE,
+							  GFP_KERNEL);
+			if (!skb) {
+				ret = -ENOMEM;
+				dev_err(common->dev, "cannot allocate skb\n");
+				if (i)
+					goto fail_rx;
 
-			return ret;
-		}
+				return ret;
+			}
 
-		ret = am65_cpsw_nuss_rx_push(common, skb);
-		if (ret < 0) {
-			dev_err(common->dev,
-				"cannot submit skb to channel rx, error %d\n",
-				ret);
-			kfree_skb(skb);
-			if (i)
-				goto fail_rx;
+			ret = am65_cpsw_nuss_rx_push(common, skb, flow_idx);
+			if (ret < 0) {
+				dev_err(common->dev,
+					"cannot submit skb to channel rx, error %d\n",
+					ret);
+				kfree_skb(skb);
+				if (i)
+					goto fail_rx;
 
-			return ret;
+				return ret;
+			}
 		}
 	}
 
@@ -535,6 +539,14 @@ static int am65_cpsw_nuss_common_open(struct am65_cpsw_common *common)
 	if (ret) {
 		dev_err(common->dev, "couldn't enable rx chn: %d\n", ret);
 		goto fail_rx;
+	}
+
+	for (i = 0; i < common->rx_ch_num_flows ; i++) {
+		napi_enable(&common->rx_chns.flows[i].napi_rx);
+		if (common->rx_chns.flows[i].irq_disabled) {
+			common->rx_chns.flows[i].irq_disabled = false;
+			enable_irq(common->rx_chns.flows[i].irq);
+		}
 	}
 
 	for (tx = 0; tx < common->tx_ch_num; tx++) {
@@ -548,16 +560,13 @@ static int am65_cpsw_nuss_common_open(struct am65_cpsw_common *common)
 		napi_enable(&common->tx_chns[tx].napi_tx);
 	}
 
-	napi_enable(&common->napi_rx);
-	if (common->rx_irq_disabled) {
-		common->rx_irq_disabled = false;
-		enable_irq(common->rx_chns.irq);
-	}
-
 	dev_dbg(common->dev, "cpsw_nuss started\n");
 	return 0;
 
 fail_tx:
+	for (i = 0; i < common->rx_ch_num_flows; i++)
+		napi_disable(&common->rx_chns.flows[i].napi_rx);
+
 	while (tx >= 0) {
 		napi_disable(&common->tx_chns[tx].napi_tx);
 		k3_udma_glue_disable_tx_chn(common->tx_chns[tx].tx_chn);
@@ -617,13 +626,13 @@ static int am65_cpsw_nuss_common_stop(struct am65_cpsw_common *common)
 			dev_err(common->dev, "rx teardown timeout\n");
 	}
 
-	napi_disable(&common->napi_rx);
-	hrtimer_cancel(&common->rx_hrtimer);
-
-	for (i = 0; i < AM65_CPSW_MAX_RX_FLOWS; i++)
+	for (i = 0; i < common->rx_ch_num_flows; i++) {
+		napi_disable(&common->rx_chns.flows[i].napi_rx);
+		hrtimer_cancel(&common->rx_chns.flows[i].rx_hrtimer);
 		k3_udma_glue_reset_rx_chn(common->rx_chns.rx_chn, i,
 					  &common->rx_chns,
 					  am65_cpsw_nuss_rx_cleanup, !!i);
+	}
 
 	k3_udma_glue_disable_rx_chn(common->rx_chns.rx_chn);
 
@@ -700,7 +709,7 @@ static int am65_cpsw_nuss_ndo_slave_open(struct net_device *ndev)
 		goto runtime_put;
 	}
 
-	ret = netif_set_real_num_rx_queues(ndev, AM65_CPSW_MAX_RX_QUEUES);
+	ret = netif_set_real_num_rx_queues(ndev, common->rx_ch_num_flows);
 	if (ret) {
 		dev_err(common->dev, "cannot set real number of rx queues\n");
 		goto runtime_put;
@@ -794,11 +803,11 @@ static void am65_cpsw_nuss_rx_csum(struct sk_buff *skb, u32 csum_info)
 	}
 }
 
-static int am65_cpsw_nuss_rx_packets(struct am65_cpsw_common *common,
-				     u32 flow_idx)
+static int am65_cpsw_nuss_rx_packets(struct am65_cpsw_rx_flow *flow)
 {
-	struct am65_cpsw_rx_chn *rx_chn = &common->rx_chns;
+	struct am65_cpsw_rx_chn *rx_chn = &flow->common->rx_chns;
 	u32 buf_dma_len, pkt_len, port_id = 0, csum_info;
+	struct am65_cpsw_common *common = flow->common;
 	struct am65_cpsw_ndev_priv *ndev_priv;
 	struct am65_cpsw_ndev_stats *stats;
 	struct cppi5_host_desc_t *desc_rx;
@@ -807,6 +816,7 @@ static int am65_cpsw_nuss_rx_packets(struct am65_cpsw_common *common,
 	dma_addr_t desc_dma, buf_dma;
 	struct am65_cpsw_port *port;
 	struct net_device *ndev;
+	u32 flow_idx = flow->id;
 	void **swdata;
 	u32 *psdata;
 	int ret = 0;
@@ -858,7 +868,7 @@ static int am65_cpsw_nuss_rx_packets(struct am65_cpsw_common *common,
 		skb_put(skb, pkt_len);
 		skb->protocol = eth_type_trans(skb, ndev);
 		am65_cpsw_nuss_rx_csum(skb, csum_info);
-		napi_gro_receive(&common->napi_rx, skb);
+		napi_gro_receive(&flow->napi_rx, skb);
 
 		stats = this_cpu_ptr(ndev_priv->stats);
 
@@ -878,7 +888,7 @@ static int am65_cpsw_nuss_rx_packets(struct am65_cpsw_common *common,
 		return 0;
 	}
 
-	ret = am65_cpsw_nuss_rx_push(common, new_skb);
+	ret = am65_cpsw_nuss_rx_push(common, new_skb, flow_idx);
 	if (WARN_ON(ret < 0)) {
 		dev_kfree_skb_any(new_skb);
 		ndev->stats.rx_errors++;
@@ -890,46 +900,39 @@ static int am65_cpsw_nuss_rx_packets(struct am65_cpsw_common *common,
 
 static enum hrtimer_restart am65_cpsw_nuss_rx_timer_callback(struct hrtimer *timer)
 {
-	struct am65_cpsw_common *common =
-			container_of(timer, struct am65_cpsw_common, rx_hrtimer);
+	struct am65_cpsw_rx_flow *flow =
+			container_of(timer, struct am65_cpsw_rx_flow, rx_hrtimer);
 
-	enable_irq(common->rx_chns.irq);
+	enable_irq(flow->irq);
 	return HRTIMER_NORESTART;
 }
 
 static int am65_cpsw_nuss_rx_poll(struct napi_struct *napi_rx, int budget)
 {
-	struct am65_cpsw_common *common = am65_cpsw_napi_to_common(napi_rx);
-	int flow = AM65_CPSW_MAX_RX_FLOWS;
-	int cur_budget, ret;
-	int num_rx = 0;
+	struct am65_cpsw_rx_flow *flow = am65_cpsw_napi_to_rx_flow(napi_rx);
+	struct am65_cpsw_common *common = flow->common;
+	int num_rx = 0, ret;
 
-	/* process every flow */
-	while (flow--) {
-		cur_budget = budget - num_rx;
-
-		while (cur_budget--) {
-			ret = am65_cpsw_nuss_rx_packets(common, flow);
-			if (ret)
-				break;
-			num_rx++;
-		}
-
-		if (num_rx >= budget)
+	/* process only this flow */
+	while (budget--) {
+		ret = am65_cpsw_nuss_rx_packets(flow);
+		if (ret)
 			break;
+
+		num_rx++;
 	}
 
 	dev_dbg(common->dev, "%s num_rx:%d %d\n", __func__, num_rx, budget);
 
 	if (num_rx < budget && napi_complete_done(napi_rx, num_rx)) {
-		if (common->rx_irq_disabled) {
-			common->rx_irq_disabled = false;
-			if (unlikely(common->rx_pace_timeout)) {
-				hrtimer_start(&common->rx_hrtimer,
-					      ns_to_ktime(common->rx_pace_timeout),
+		if (flow->irq_disabled) {
+			flow->irq_disabled = false;
+			if (unlikely(flow->rx_pace_timeout)) {
+				hrtimer_start(&flow->rx_hrtimer,
+					      ns_to_ktime(flow->rx_pace_timeout),
 					      HRTIMER_MODE_REL_PINNED);
 			} else {
-				enable_irq(common->rx_chns.irq);
+				enable_irq(flow->irq);
 			}
 		}
 	}
@@ -1119,11 +1122,11 @@ static int am65_cpsw_nuss_tx_poll(struct napi_struct *napi_tx, int budget)
 
 static irqreturn_t am65_cpsw_nuss_rx_irq(int irq, void *dev_id)
 {
-	struct am65_cpsw_common *common = dev_id;
+	struct am65_cpsw_rx_flow *flow = dev_id;
 
-	common->rx_irq_disabled = true;
+	flow->irq_disabled = true;
 	disable_irq_nosync(irq);
-	napi_schedule(&common->napi_rx);
+	napi_schedule(&flow->napi_rx);
 
 	return IRQ_HANDLED;
 }
@@ -1859,19 +1862,23 @@ static void am65_cpsw_nuss_free_rx_chns(void *data)
 		k3_udma_glue_release_rx_chn(rx_chn->rx_chn);
 }
 
-static void am65_cpsw_nuss_remove_rx_chns(void *data)
+void am65_cpsw_nuss_remove_rx_chns(void *data)
 {
 	struct am65_cpsw_common *common = data;
 	struct am65_cpsw_rx_chn *rx_chn;
 	struct device *dev = common->dev;
+	struct am65_cpsw_rx_flow *flows;
+	int i;
 
 	rx_chn = &common->rx_chns;
+	flows = rx_chn->flows;
 	devm_remove_action(dev, am65_cpsw_nuss_free_rx_chns, common);
 
-	if (!(rx_chn->irq < 0))
-		devm_free_irq(dev, rx_chn->irq, common);
-
-	netif_napi_del(&common->napi_rx);
+	for (i = 0; i < common->rx_ch_num_flows; i++) {
+		if (!(flows[i].irq < 0))
+			devm_free_irq(dev, flows[i].irq, &flows[i]);
+		netif_napi_del(&flows[i].napi_rx);
+	}
 
 	if (!IS_ERR_OR_NULL(rx_chn->desc_pool))
 		k3_cppi_desc_pool_destroy(rx_chn->desc_pool);
@@ -1886,6 +1893,7 @@ static int am65_cpsw_nuss_init_rx_chns(struct am65_cpsw_common *common)
 {
 	struct am65_cpsw_rx_chn *rx_chn = &common->rx_chns;
 	struct k3_udma_glue_rx_channel_cfg rx_cfg = { 0 };
+	struct am65_cpsw_rx_flow *flows = rx_chn->flows;
 	u32  max_desc_num = AM65_CPSW_MAX_RX_DESC;
 	struct device *dev = common->dev;
 	u32 hdesc_size;
@@ -1896,12 +1904,12 @@ static int am65_cpsw_nuss_init_rx_chns(struct am65_cpsw_common *common)
 					   AM65_CPSW_NAV_SW_DATA_SIZE);
 
 	rx_cfg.swdata_size = AM65_CPSW_NAV_SW_DATA_SIZE;
-	rx_cfg.flow_id_num = AM65_CPSW_MAX_RX_FLOWS;
+	rx_cfg.flow_id_num = common->rx_ch_num_flows;
 	rx_cfg.flow_id_base = common->rx_flow_id_base;
 
 	/* init all flows */
 	rx_chn->dev = dev;
-	rx_chn->descs_num = max_desc_num;
+	rx_chn->descs_num = max_desc_num * rx_cfg.flow_id_num;
 
 	rx_chn->rx_chn = k3_udma_glue_request_rx_chn(dev, "rx", &rx_cfg);
 	if (IS_ERR(rx_chn->rx_chn)) {
@@ -1943,6 +1951,8 @@ static int am65_cpsw_nuss_init_rx_chns(struct am65_cpsw_common *common)
 				K3_UDMA_GLUE_SRC_TAG_LO_USE_REMOTE_SRC_TAG,
 		};
 
+		flows[i].id = i;
+		flows[i].common = common;
 		rx_flow_cfg.ring_rxfdq0_id = fdqring_id;
 		rx_flow_cfg.rx_cfg.size = max_desc_num;
 		rx_flow_cfg.rxfdq_cfg.size = max_desc_num;
@@ -1959,28 +1969,31 @@ static int am65_cpsw_nuss_init_rx_chns(struct am65_cpsw_common *common)
 				k3_udma_glue_rx_flow_get_fdq_id(rx_chn->rx_chn,
 								i);
 
-		rx_chn->irq = k3_udma_glue_rx_get_irq(rx_chn->rx_chn, i);
-
-		if (rx_chn->irq <= 0) {
+		flows[i].irq = k3_udma_glue_rx_get_irq(rx_chn->rx_chn, i);
+		if (flows[i].irq <= 0) {
 			dev_err(dev, "Failed to get rx dma irq %d\n",
-				rx_chn->irq);
+				flows[i].irq);
 			ret = -ENXIO;
 			goto err;
 		}
-	}
 
-	netif_napi_add(common->dma_ndev, &common->napi_rx,
-		       am65_cpsw_nuss_rx_poll);
-	hrtimer_init(&common->rx_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
-	common->rx_hrtimer.function = &am65_cpsw_nuss_rx_timer_callback;
+		snprintf(flows[i].name,
+			 sizeof(flows[i].name), "%s-rx%d",
+			 dev_name(dev), i);
+		netif_napi_add(common->dma_ndev, &flows[i].napi_rx,
+			       am65_cpsw_nuss_rx_poll);
+		hrtimer_init(&flows[i].rx_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+		flows[i].rx_hrtimer.function = &am65_cpsw_nuss_rx_timer_callback;
 
-	ret = devm_request_irq(dev, rx_chn->irq,
-			       am65_cpsw_nuss_rx_irq,
-			       IRQF_TRIGGER_HIGH, dev_name(dev), common);
-	if (ret) {
-		dev_err(dev, "failure requesting rx irq %u, %d\n",
-			rx_chn->irq, ret);
-		goto err;
+		ret = devm_request_irq(dev, flows[i].irq,
+				       am65_cpsw_nuss_rx_irq,
+				       IRQF_TRIGGER_HIGH,
+				       flows[i].name, &flows[i]);
+		if (ret) {
+			dev_err(dev, "failure requesting rx %d irq %u, %d\n",
+				i, flows[i].irq, ret);
+			goto err;
+		}
 	}
 
 err:
@@ -2817,7 +2830,7 @@ static int am65_cpsw_nuss_register_ndevs(struct am65_cpsw_common *common)
 		k3_udma_glue_disable_tx_chn(tx_chan[i].tx_chn);
 	}
 
-	for (i = 0; i < AM65_CPSW_MAX_RX_FLOWS; i++)
+	for (i = 0; i < common->rx_ch_num_flows; i++)
 		k3_udma_glue_reset_rx_chn(rx_chan->rx_chn, i, rx_chan,
 					  am65_cpsw_nuss_rx_cleanup, !!i);
 
@@ -2860,12 +2873,17 @@ err_cleanup_ndev:
 	return ret;
 }
 
-int am65_cpsw_nuss_update_tx_chns(struct am65_cpsw_common *common, int num_tx)
+int am65_cpsw_nuss_update_tx_rx_chns(struct am65_cpsw_common *common, int num_tx, int num_rx)
 {
 	int ret;
 
 	common->tx_ch_num = num_tx;
+	common->rx_ch_num_flows = num_rx;
 	ret = am65_cpsw_nuss_init_tx_chns(common);
+	if (ret)
+		return ret;
+
+	ret = am65_cpsw_nuss_init_rx_chns(common);
 
 	return ret;
 }
@@ -2994,6 +3012,7 @@ static int am65_cpsw_nuss_probe(struct platform_device *pdev)
 	common->rx_flow_id_base = -1;
 	init_completion(&common->tdown_complete);
 	common->tx_ch_num = AM65_CPSW_DEFAULT_TX_CHNS;
+	common->rx_ch_num_flows = AM65_CPSW_DEFAULT_RX_CHN_FLOWS;
 	common->pf_p0_rx_ptype_rrobin = false;
 	common->default_vlan = 1;
 
@@ -3185,8 +3204,10 @@ static int am65_cpsw_nuss_resume(struct device *dev)
 		return ret;
 
 	/* If RX IRQ was disabled before suspend, keep it disabled */
-	if (common->rx_irq_disabled)
-		disable_irq(common->rx_chns.irq);
+	for (i = 0; i < common->rx_ch_num_flows; i++) {
+		if (common->rx_chns.flows[i].irq_disabled)
+			disable_irq(common->rx_chns.flows[i].irq);
+	}
 
 	am65_cpts_resume(common->cpts);
 

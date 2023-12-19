@@ -429,7 +429,7 @@ static void am65_cpsw_get_channels(struct net_device *ndev,
 
 	ch->max_rx = AM65_CPSW_MAX_RX_QUEUES;
 	ch->max_tx = AM65_CPSW_MAX_TX_QUEUES;
-	ch->rx_count = AM65_CPSW_MAX_RX_QUEUES;
+	ch->rx_count = common->rx_ch_num_flows;
 	ch->tx_count = common->tx_ch_num;
 }
 
@@ -448,8 +448,9 @@ static int am65_cpsw_set_channels(struct net_device *ndev,
 		return -EBUSY;
 
 	am65_cpsw_nuss_remove_tx_chns(common);
+	am65_cpsw_nuss_remove_rx_chns(common);
 
-	return am65_cpsw_nuss_update_tx_chns(common, chs->tx_count);
+	return am65_cpsw_nuss_update_tx_rx_chns(common, chs->tx_count, chs->rx_count);
 }
 
 static void
@@ -910,10 +911,12 @@ static int am65_cpsw_get_coalesce(struct net_device *ndev, struct ethtool_coales
 {
 	struct am65_cpsw_common *common = am65_ndev_to_common(ndev);
 	struct am65_cpsw_tx_chn *tx_chn;
+	struct am65_cpsw_rx_flow *rx_flow;
 
 	tx_chn = &common->tx_chns[0];
+	rx_flow = &common->rx_chns.flows[0];
 
-	coal->rx_coalesce_usecs = common->rx_pace_timeout / 1000;
+	coal->rx_coalesce_usecs = rx_flow->rx_pace_timeout / 1000;
 	coal->tx_coalesce_usecs = tx_chn->tx_pace_timeout / 1000;
 
 	return 0;
@@ -924,13 +927,24 @@ static int am65_cpsw_get_per_queue_coalesce(struct net_device *ndev, u32 queue,
 {
 	struct am65_cpsw_common *common = am65_ndev_to_common(ndev);
 	struct am65_cpsw_tx_chn *tx_chn;
+	struct am65_cpsw_rx_flow *rx_flow;
 
-	if (queue >= AM65_CPSW_MAX_TX_QUEUES)
+	if (queue >= AM65_CPSW_MAX_TX_QUEUES && queue >= AM65_CPSW_MAX_RX_QUEUES)
 		return -EINVAL;
 
-	tx_chn = &common->tx_chns[queue];
+	if (queue < AM65_CPSW_MAX_TX_QUEUES) {
+		tx_chn = &common->tx_chns[queue];
+		coal->tx_coalesce_usecs = tx_chn->tx_pace_timeout / 1000;
+	} else {
+		coal->tx_coalesce_usecs = ~0;
+	}
 
-	coal->tx_coalesce_usecs = tx_chn->tx_pace_timeout / 1000;
+	if (queue < AM65_CPSW_MAX_RX_QUEUES) {
+		rx_flow = &common->rx_chns.flows[queue];
+		coal->rx_coalesce_usecs = rx_flow->rx_pace_timeout / 1000;
+	} else {
+		coal->rx_coalesce_usecs = ~0;
+	}
 
 	return 0;
 }
@@ -941,8 +955,10 @@ static int am65_cpsw_set_coalesce(struct net_device *ndev, struct ethtool_coales
 {
 	struct am65_cpsw_common *common = am65_ndev_to_common(ndev);
 	struct am65_cpsw_tx_chn *tx_chn;
+	struct am65_cpsw_rx_flow *rx_flow;
 
 	tx_chn = &common->tx_chns[0];
+	rx_flow = &common->rx_chns.flows[0];
 
 	if (coal->rx_coalesce_usecs && coal->rx_coalesce_usecs < 20)
 		return -EINVAL;
@@ -950,7 +966,7 @@ static int am65_cpsw_set_coalesce(struct net_device *ndev, struct ethtool_coales
 	if (coal->tx_coalesce_usecs && coal->tx_coalesce_usecs < 20)
 		return -EINVAL;
 
-	common->rx_pace_timeout = coal->rx_coalesce_usecs * 1000;
+	rx_flow->rx_pace_timeout = coal->rx_coalesce_usecs * 1000;
 	tx_chn->tx_pace_timeout = coal->tx_coalesce_usecs * 1000;
 
 	return 0;
@@ -961,19 +977,34 @@ static int am65_cpsw_set_per_queue_coalesce(struct net_device *ndev, u32 queue,
 {
 	struct am65_cpsw_common *common = am65_ndev_to_common(ndev);
 	struct am65_cpsw_tx_chn *tx_chn;
+	struct am65_cpsw_rx_flow *rx_flow;
 
-	if (queue >= AM65_CPSW_MAX_TX_QUEUES)
+	if (queue >= AM65_CPSW_MAX_TX_QUEUES && queue >= AM65_CPSW_MAX_RX_QUEUES)
 		return -EINVAL;
 
-	tx_chn = &common->tx_chns[queue];
+	if (queue < AM65_CPSW_MAX_TX_QUEUES) {
+		tx_chn = &common->tx_chns[queue];
 
-	if (coal->tx_coalesce_usecs && coal->tx_coalesce_usecs < 20) {
-		dev_info(common->dev, "defaulting to min value of 20us for tx-usecs for tx-%u\n",
-			 queue);
-		coal->tx_coalesce_usecs = 20;
+		if (coal->tx_coalesce_usecs && coal->tx_coalesce_usecs < 20) {
+			dev_info(common->dev, "defaulting to min value of 20us for tx-usecs for tx-%u\n",
+				 queue);
+			coal->tx_coalesce_usecs = 20;
+		}
+
+		tx_chn->tx_pace_timeout = coal->tx_coalesce_usecs * 1000;
 	}
 
-	tx_chn->tx_pace_timeout = coal->tx_coalesce_usecs * 1000;
+	if (queue < AM65_CPSW_MAX_RX_QUEUES) {
+		rx_flow = &common->rx_chns.flows[queue];
+
+		if (coal->rx_coalesce_usecs && coal->rx_coalesce_usecs < 20) {
+			dev_info(common->dev, "defaulting to min value of 20us for rx-usecs for rx-%u\n",
+				 queue);
+			coal->rx_coalesce_usecs = 20;
+		}
+
+		rx_flow->rx_pace_timeout = coal->rx_coalesce_usecs * 1000;
+	}
 
 	return 0;
 }
