@@ -429,7 +429,7 @@ static void am65_cpsw_get_channels(struct net_device *ndev,
 
 	ch->max_rx = AM65_CPSW_MAX_RX_QUEUES;
 	ch->max_tx = AM65_CPSW_MAX_TX_QUEUES;
-	ch->rx_count = AM65_CPSW_MAX_RX_QUEUES;
+	ch->rx_count = common->rx_ch_num_flows;
 	ch->tx_count = common->tx_ch_num;
 }
 
@@ -448,8 +448,9 @@ static int am65_cpsw_set_channels(struct net_device *ndev,
 		return -EBUSY;
 
 	am65_cpsw_nuss_remove_tx_chns(common);
+	am65_cpsw_nuss_remove_rx_chns(common);
 
-	return am65_cpsw_nuss_update_tx_chns(common, chs->tx_count);
+	return am65_cpsw_nuss_update_tx_rx_chns(common, chs->tx_count, chs->rx_count);
 }
 
 static void
